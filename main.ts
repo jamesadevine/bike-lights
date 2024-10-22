@@ -477,7 +477,7 @@ class BikeLights extends Effect {
     }
 }
 
-class BikeLightsFaked extends Effect {
+class BikeLightsBlinking extends Effect {
     light_state: BikeLightState
     left_brake_range: neopixel.Strip
     left_indicator_range: neopixel.Strip
@@ -486,12 +486,14 @@ class BikeLightsFaked extends Effect {
     right_indicator_range: neopixel.Strip
     right_interior_range: neopixel.Strip
     averager: AccelerometerAverage;
-    inner_tick_rate: number
+    indicator_tick_rate: number
+    brake_tick_rate:number
 
     constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
         super(left_strip, right_strip)
         this.tick_rate = 1; // call each loop
-        this.inner_tick_rate = 0;
+        this.indicator_tick_rate = 0;
+        this.brake_tick_rate = 0
         this.left_indicator_range = this.left_strip.range(INDICATOR_LIGHT_START, INDICATOR_LIGHT_END);
         this.left_brake_range = this.left_strip.range(INDICATOR_LIGHT_END, BRAKE_LIGHT_END - INDICATOR_LIGHT_END);
         this.left_interior_range = this.left_strip.range(BRAKE_LIGHT_END, INTERIOR_LIGHT_END - BRAKE_LIGHT_END)
@@ -503,7 +505,8 @@ class BikeLightsFaked extends Effect {
     initialise() {
         this.default_strip_settings()
         light_state.reset()
-        this.inner_tick_rate = 0
+        this.indicator_tick_rate = 0
+        this.brake_tick_rate = 0
 
         broadcastLightEffect(LightEffectMode.BikeLights)
     }
@@ -518,6 +521,12 @@ class BikeLightsFaked extends Effect {
             this.right_interior_range.setBrightness(INTERIOR_LIGHT_BRIGHTNESS)
         }
 
+        this.brake_tick_rate = (this.brake_tick_rate + 1) % (2*STANDARD_QUANTUM)
+        
+        if (this.brake_tick_rate == 0) {
+            light_state.toggle_state(LightState.Brake)
+        }
+
         // light_state.set_flag(LightState.Brake);
         setAllRgb(this.left_brake_range, 0xff0000)
         setAllRgb(this.right_brake_range, 0xff0000)
@@ -529,9 +538,9 @@ class BikeLightsFaked extends Effect {
             this.right_brake_range.setBrightness(NIGHT_LIGHT_BRIGHTNESS);
         }
 
-        this.inner_tick_rate = (this.inner_tick_rate + 1) % STANDARD_QUANTUM;
+        this.indicator_tick_rate = (this.indicator_tick_rate + 1) % STANDARD_QUANTUM;
 
-        if (this.inner_tick_rate == 0) {
+        if (this.indicator_tick_rate == 0) {
             if (light_state.get_flag(LightMode.IndicateLeft)) {
                 light_state.toggle_left_indicator()
 
@@ -611,7 +620,7 @@ const light_state = new BikeLightState()
 let left_strip = neopixel.create(DigitalPin.P0, STRIP_LENGTH, NeoPixelMode.RGB)
 let right_strip = neopixel.create(DigitalPin.P1, STRIP_LENGTH, NeoPixelMode.RGB)
 
-let effects = [new BikeLightsFaked(left_strip, right_strip), new Hazard(left_strip, right_strip), new Rainbow(left_strip, right_strip), new BumbleBee(left_strip, right_strip), new BikeLightsFaked(left_strip, right_strip)]
+let effects = [new BikeLightsBlinking(left_strip, right_strip), new Hazard(left_strip, right_strip), new Rainbow(left_strip, right_strip), new BumbleBee(left_strip, right_strip), new BikeLights(left_strip, right_strip)]
 let effects_idx = 0
 
 input.onButtonPressed(Button.AB, function() {
