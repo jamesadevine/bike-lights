@@ -1,689 +1,329 @@
-const PAUSE_QUANTUM = 50
-const STANDARD_QUANTUM = 4
-
-const RADIO_GROUP = 99
-const SAMPLE_SIZE = 10
-const BRAKE_THRESHOLD = 1100
-const ACCEL_THRESHOLD = 1000
-
 const STRIP_LENGTH = 96
-const INDICATOR_LIGHT_START = 0
-const INDICATOR_LIGHT_END = 30
-const BRAKE_LIGHT_START = INDICATOR_LIGHT_END
-const BRAKE_LIGHT_END = 75
-const INTERIOR_LIGHT_START = BRAKE_LIGHT_END
-const INTERIOR_LIGHT_END = STRIP_LENGTH
+const LEFT_INDICATOR_END = Math.floor(STRIP_LENGTH / 4)
+const RIGHT_INDICATOR_START = STRIP_LENGTH - LEFT_INDICATOR_END
+const NIGHT_BRIGHTNESS = 8
+const FRONT_BRIGHTNESS = [64, 128, 192, 255]
+const FRONT_COLORS = [0xffffff, 0xffaa55, 0xff0000, 0x00ff00, 0x0000ff]
+const FRAME_INTERVAL = 50
+const BLINK_INTERVAL = 200
+const STATUS_INTERVAL = 250
+const CALIBRATION_SAMPLES = 50
+const BRAKE_THRESHOLD = 120
+const BRAKE_RELEASE_THRESHOLD = 50
 
-const NIGHT_LIGHT_BRIGHTNESS = 8
-const INTERIOR_LIGHT_BRIGHTNESS = 64;
-const BRAKE_LIGHT_BRIGHTNESS = 255
+class BrakeSensor {
+    baseline = 0
+    calibrated = false
+    braking = false
+    filtered = 0
+    calibration_sum = 0
+    calibration_count = 0
+    calibration_min = 2048
+    calibration_max = -2048
 
-
-
-enum BikeState {
-    Accelerating,
-    Braking
-}
-
-class AccelerometerAverage {
-    _samples: number[]
-    _sample_index = 0;
-    _last_sample = 0
-    _state = BikeState.Braking
     constructor() {
-        this._last_sample = 0
-        this._samples = [];
-        for (let i = 0; i < SAMPLE_SIZE; i++) {
-            this._samples.push(0)
-        }
     }
 
-    get state() {
-        return this._state;
-    }
-
-    sample() {
-        const sample = input.acceleration(Dimension.Strength)
-        this._samples[this._sample_index] = sample;
-
-        this._sample_index = (this._sample_index + 1) % SAMPLE_SIZE;
-
-        if (this._sample_index == 0) {
-            this._computeAverageSample()
+    sample(value: number) {
+        if (!this.calibrated) {
+            this.calibration_sum += value
+            this.calibration_count++
+            this.calibration_min = Math.min(this.calibration_min, value)
+            this.calibration_max = Math.max(this.calibration_max, value)
+            if (this.calibration_count == CALIBRATION_SAMPLES) {
+                if (this.calibration_max - this.calibration_min <= 80) {
+                    this.baseline = this.calibration_sum / CALIBRATION_SAMPLES
+                    this.calibrated = true
+                    console.log("Brake Z baseline (mg): " + this.baseline)
+                } else {
+                    console.log("Brake calibration: keep the mounted bike stationary")
+                    this.calibration_sum = 0
+                    this.calibration_count = 0
+                    this.calibration_min = 2048
+                    this.calibration_max = -2048
+                }
+            }
+            return
         }
-    }
-
-    _computeAverageSample() {
-        let avg = 0;
-        for (let j = 0; j < SAMPLE_SIZE; j++) {
-            avg += this._samples[j];
-        }
-
-        avg = avg / SAMPLE_SIZE;
-
-        if (avg > BRAKE_THRESHOLD) {
-            this._state = BikeState.Braking
-        } else if (avg < ACCEL_THRESHOLD) {
-            this._state = BikeState.Accelerating
-        }
+        // Face forward: MakeCode Z is positive under deceleration.
+        this.filtered += (value - this.baseline - this.filtered) / 4
+        const was_braking = this.braking
+        if (this.filtered >= BRAKE_THRESHOLD)
+            this.braking = true
+        else if (this.filtered <= BRAKE_RELEASE_THRESHOLD)
+            this.braking = false
+        if (this.braking != was_braking)
+            console.log("Brake " + (this.braking ? "on" : "off") + ", Z delta (mg): " + this.filtered)
     }
 }
 
-enum ControlCommand {
-    Clear = 0,
-    IndicateLeft,
-    IndicateRight,
-    NightMode,
-    DayMode,
-    NextMode,
-    ForceBrakeLights
+class LightStrip {
+    strip: neopixel.Strip
+    pixels: number[]
+    dirty = false
+
+    constructor(pin: DigitalPin) {
+        this.strip = neopixel.create(pin, STRIP_LENGTH, NeoPixelMode.RGB)
+        this.strip.setBrightness(255)
+        this.pixels = []
+        for (let i = 0; i < STRIP_LENGTH; i++)
+            this.pixels.push(-1)
+    }
+
+    fill(start: number, end: number, color: number, brightness: number) {
+        let scaled = color
+        if (brightness < 255) {
+            const red = (((color >> 16) & 255) * brightness) >> 8
+            const green = (((color >> 8) & 255) * brightness) >> 8
+            const blue = ((color & 255) * brightness) >> 8
+            scaled = (red << 16) | (green << 8) | blue
+        }
+        for (let i = start; i < end; i++) {
+            if (this.pixels[i] != scaled) {
+                this.pixels[i] = scaled
+                this.strip.setPixelColor(i, scaled)
+                this.dirty = true
+            }
+        }
+    }
+
+    show() {
+        if (this.dirty) {
+            this.dirty = false
+            this.strip.show()
+        }
+    }
 }
 
-enum LightEffectMode {
-    BikeLights,
-    BumbleBee,
-    Rainbow,
-    Hazards,
-}
+class ControllerPeer {
+    session = 0
+    sequence = 0
+    retired: number[]
 
-enum LightState {
-    Brake = 0x01,
-    LeftIndicate = 0x02,
-    RightIndicate = 0x04
-}
-
-enum LightMode {
-    Braking = 0x10,
-    IndicateLeft = 0x20,
-    IndicateRight = 0x40,
-    NightLights = 0x80
-}
-
-class BikeLightState {
-    _light_state:number;
     constructor() {
-        this._light_state = 0;
+        this.retired = []
     }
 
-
-    reset() {
-        this._light_state = 0;
-    }
-
-    get state(): number {
-        return this._light_state;
-    }
-
-    toggle_mode(mode: LightMode) {
-        this.get_flag(mode) ? this.unset_flag(mode) : this.set_flag(mode)
-    }
-
-    toggle_state(state: LightState) {
-        console.log(`get flag: ${this.get_flag(state)}`)
-        this.get_flag(state) ? this.unset_flag(state) : this.set_flag(state)
-    }
-
-    get_flag(flag: number) : boolean {
-        return (this.state & flag) > 0
-    }
-
-    set_flag(flag: number){
-        this._light_state |= flag
-    }
-
-    unset_flag(flag: number) {
-        this._light_state &= ~(flag)
-    }
-
-    toggle_left_indicator() {
-        this.toggle_state(LightState.LeftIndicate)
-    }
-
-    toggle_right_indicator() {
-        this.toggle_state(LightState.RightIndicate)
-    }
-}
-
-const broadcastLightEffect = (state: LightEffectMode) => {
-    radio.sendNumber(state)
-}
-
-const broadcastEffectCommand = (command: number) => {
-    if (command <= 0xf)
-        return;
-    radio.sendNumber(command)
-}
-
-const setAllRgb = (strip: neopixel.Strip, rgb: number)=>{
-    for (let i = 0; i < strip.length(); i++) 
-        strip.setPixelColor(i, rgb)
-}
-
-class Effect {
-    left_strip: neopixel.Strip
-    right_strip: neopixel.Strip
-    tick_rate: number
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        this.left_strip = left_strip
-        this.right_strip = right_strip
-        this.tick_rate = STANDARD_QUANTUM;
-    }
-
-    default_strip_settings() {
-        this.left_strip.clear()
-        this.right_strip.clear()
-        this.left_strip.setBrightness(128)
-        this.right_strip.setBrightness(128)
-    }
-
-    initialise() {
-        this.default_strip_settings()
-    }
-
-    tick() {
-
-    }
-
-    done() : boolean {
-        return false
-    }
-}
-
-const KNIGHT_RIDE_START = (BRAKE_LIGHT_END - 25)
-
-class KnightRider extends Effect {
-    anim_idx: number
-    complete: boolean
-    left_to_right: boolean
-    anim_count: number
-    inc_dec:number
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        super(left_strip, right_strip)
-        this.tick_rate = 1;
-        this.anim_idx = 0
-        this.left_to_right = true
-        this.complete = false
-        this.anim_count = 0
-    }
-
-    done() {
-        return this.complete
-    }
-
-    initialise() {
-        this.default_strip_settings()
-        this.anim_idx = 0
-    }
-
-    tick() {
-        const idx = this.anim_idx
-
-        this.left_strip.clear()
-        this.right_strip.clear()
-
-        if (idx > KNIGHT_RIDE_START) {
-            this.right_strip.setPixelColor(this.anim_idx - KNIGHT_RIDE_START, 0xff0000)
-        } else {
-            this.left_strip.setPixelColor(KNIGHT_RIDE_START - this.anim_idx, 0xff0000)
-        }
-
-
-        if (this.left_to_right)
-            this.anim_idx++;
-        else    
-            this.anim_idx--;
-
-        if (this.anim_idx == (2 * KNIGHT_RIDE_START) || this.anim_idx == 0) {
-            this.anim_count++
-            this.left_to_right = !this.left_to_right;
-        }
-
-        if (this.anim_count > 2) {
-            this.complete = true
-        }
-            
-    }
-}
-
-class Smile extends Effect {
-    smile_idx: number
-    smile_complete: boolean
-    wink_complete: boolean
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        super(left_strip, right_strip)
-        this.tick_rate = 1;
-        this.smile_idx = 0
-        this.smile_complete = false
-        this.wink_complete = false
-    }
-
-    done() {
-        return this.smile_complete && this.wink_complete
-    }
-
-    initialise() {
-        this.default_strip_settings()
-        this.smile_idx = 0
-    }
-
-    tick () {
-        const idx = this.smile_idx
-        if (idx < 40) {
-            this.left_strip.setPixelColor(idx, 0xffffff);
-            this.right_strip.setPixelColor(idx, 0xffffff);
-            
-        } else {
-            let col = 0xffffff;
-            if (idx > 140) {
-                this.smile_complete = true;
-                col = 0
+    accept(session: number, sequence: number): boolean {
+        if (this.retired.indexOf(session) >= 0)
+            return false
+        if (session != this.session) {
+            if (this.session != 0) {
+                this.retired.push(this.session)
+                if (this.retired.length > 8)
+                    this.retired.shift()
             }
-                
-            if (idx > 240)
-                col = 0xffffff
-
-            if (idx > 340)
-                this.wink_complete = true;
-
-            if (!this.smile_complete) {
-                for (let i = INTERIOR_LIGHT_START; i > INTERIOR_LIGHT_START - 15; i--) {
-                    this.left_strip.setPixelColor(i, col);
-                    this.right_strip.setPixelColor(i, col);
-                }
-            } else {
-                // wink right
-                for (let i = INTERIOR_LIGHT_START; i > INTERIOR_LIGHT_START - 15; i--) {
-                    this.right_strip.setPixelColor(i, col);
-                }
-            }
+            this.session = session
+            this.sequence = 0
         }
-
-        this.smile_idx++;
+        if (sequence <= this.sequence)
+            return false
+        this.sequence = sequence
+        return true
     }
 }
 
-class BumbleBee extends Effect {
-    initialise() {
-        this.default_strip_settings()
+const light_actions: BikeRadio.Action[] = []
+const rear_peer = new ControllerPeer()
+const cabin_peer = new ControllerPeer()
+const lights_session = BikeRadio.session()
+const brake_sensor = new BrakeSensor()
+const front_strip = new LightStrip(DigitalPin.P0)
+const rear_strip = new LightStrip(DigitalPin.P1)
+let rear_inbox: Buffer = null
+let cabin_inbox: Buffer = null
+let desired_state = BikeRadio.Mode.Automatic | BikeRadio.NIGHT
+let rendered_state = -1
+let status_revision = 0
+let status_due = 3
+let last_rear_status = input.runningTime()
+let last_cabin_status = input.runningTime()
+let last_status_domain = BikeRadio.Domain.Cabin
+let last_frame = input.runningTime()
+let last_sample = input.runningTime()
+let mode_started = input.runningTime()
+let indicator_started = input.runningTime()
+let front_started = input.runningTime()
+let startup_started = input.runningTime()
+let startup = true
 
-        for (let i = 0; i < STRIP_LENGTH; i++) {
-            let col = 0
-            if (i % 2 == 0) {
-                col = 0xffff00;
-            }
-            this.left_strip.setPixelColor(i, col);
-            this.right_strip.setPixelColor(i, col);
-        }
-
-        broadcastLightEffect(LightEffectMode.BumbleBee)
-    }
-
-    tick() {
-        this.left_strip.rotate()
-        this.right_strip.rotate()
-    }
-}
-
-class Rainbow extends Effect {
-    initialise() {
-        this.default_strip_settings()
-        this.left_strip.showRainbow()
-        this.right_strip.showRainbow()
-
-        broadcastLightEffect(LightEffectMode.Rainbow)
-    }
-
-    tick() {
-        this.left_strip.rotate()
-        this.right_strip.rotate()
-    }
-}
-
-enum HazardsEffectState {
-    On = 0x10,
-    Off,
-}
-class Hazard extends Effect {
-    on_off: boolean
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        super(left_strip, right_strip)
-        this.on_off = false
-    }
-
-    initialise() {
-        this.default_strip_settings();
-
-        broadcastLightEffect(LightEffectMode.Hazards)
-    }
-
-    tick() {
-        this.on_off = !this.on_off;
-
-        if (this.on_off) {
-            broadcastEffectCommand(HazardsEffectState.On)
-            setAllRgb(this.left_strip, 0xffa500)
-            setAllRgb(this.right_strip, 0xffa500)
-        } else {
-            broadcastEffectCommand(HazardsEffectState.Off)
-            setAllRgb(this.left_strip, 0)
-            setAllRgb(this.right_strip, 0)
-        }
-    }
-}
-
-enum BikeLightEffectState {
-    LeftOn = 0x10,
-    LeftOff,
-    RightOn,
-    RightOff
-}
-class BikeLights extends Effect {
-    left_brake_range: neopixel.Strip
-    left_indicator_range: neopixel.Strip
-    left_interior_range: neopixel.Strip
-    right_brake_range: neopixel.Strip
-    right_indicator_range: neopixel.Strip
-    right_interior_range: neopixel.Strip
-    averager: AccelerometerAverage;
-    inner_tick_rate: number
-
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        super(left_strip, right_strip)
-        this.tick_rate = 1; // call each loop
-        this.inner_tick_rate = 0;
-        this.left_indicator_range = this.left_strip.range(INDICATOR_LIGHT_START, INDICATOR_LIGHT_END);
-        this.left_brake_range = this.left_strip.range(INDICATOR_LIGHT_END, BRAKE_LIGHT_END - INDICATOR_LIGHT_END);
-        this.left_interior_range = this.left_strip.range(BRAKE_LIGHT_END, INTERIOR_LIGHT_END - BRAKE_LIGHT_END)
-        this.right_indicator_range = this.right_strip.range(INDICATOR_LIGHT_START, INDICATOR_LIGHT_END);
-        this.right_brake_range = this.right_strip.range(INDICATOR_LIGHT_END, BRAKE_LIGHT_END - INDICATOR_LIGHT_END);
-        this.right_interior_range = this.right_strip.range(BRAKE_LIGHT_END, INTERIOR_LIGHT_END - BRAKE_LIGHT_END)
-
-        this.averager = new AccelerometerAverage()
-    }
-    
-    initialise() {
-        this.default_strip_settings()
-        light_state.reset()
-        this.inner_tick_rate = 0
-
-        broadcastLightEffect(LightEffectMode.BikeLights)
-    }
-
-    tick() {
-        averager.sample()
-
-        if (averager.state == BikeState.Braking)
-            light_state.set_flag(LightState.Brake)
-        else
-            light_state.unset_flag(LightState.Brake)
-
-        if (light_state.get_flag(LightMode.NightLights)) {
-            setAllRgb(this.left_brake_range, 0xff0000)
-            setAllRgb(this.right_brake_range, 0xff0000)
-            this.left_brake_range.setBrightness(NIGHT_LIGHT_BRIGHTNESS);
-            this.right_brake_range.setBrightness(NIGHT_LIGHT_BRIGHTNESS);
-
-            setAllRgb(this.left_interior_range, 0xffffff)
-            setAllRgb(this.right_interior_range, 0xffffff)
-            this.left_interior_range.setBrightness(INTERIOR_LIGHT_BRIGHTNESS)
-            this.right_interior_range.setBrightness(INTERIOR_LIGHT_BRIGHTNESS)
-        }
-
-        if (light_state.get_flag(LightState.Brake)) {
-            setAllRgb(this.left_brake_range, 0xff0000)
-            setAllRgb(this.right_brake_range, 0xff0000)
-            this.left_brake_range.setBrightness(BRAKE_LIGHT_BRIGHTNESS);
-            this.right_brake_range.setBrightness(BRAKE_LIGHT_BRIGHTNESS);
-        }
-
-        if (!light_state.get_flag(LightMode.NightLights) && !light_state.get_flag(LightState.Brake)) {
-            setAllRgb(this.left_brake_range, 0)
-            setAllRgb(this.right_brake_range, 0)
-        }
-        
-        this.inner_tick_rate = (this.inner_tick_rate + 1) % STANDARD_QUANTUM;
-
-        if (this.inner_tick_rate == 0) {
-            if (light_state.get_flag(LightMode.IndicateLeft)) {
-                light_state.toggle_left_indicator()
-
-                if (light_state.get_flag(LightState.LeftIndicate)) {
-                    broadcastEffectCommand(BikeLightEffectState.LeftOn)
-                    setAllRgb(this.left_indicator_range, 0xffa500)
-                } else {
-                    setAllRgb(this.left_indicator_range, 0)
-                    broadcastEffectCommand(BikeLightEffectState.LeftOff)
-                }
-                    
-            } else {
-                setAllRgb(this.left_indicator_range, 0)
-            }
-
-            if (light_state.get_flag(LightMode.IndicateRight)) {
-                light_state.toggle_right_indicator()
-
-                if (light_state.get_flag(LightState.RightIndicate)) {
-                    broadcastEffectCommand(BikeLightEffectState.RightOn)
-                    setAllRgb(this.right_indicator_range, 0xffa500)
-                } else {
-                    setAllRgb(this.right_indicator_range, 0)
-                    broadcastEffectCommand(BikeLightEffectState.RightOff)
-                }
-            } else {
-                setAllRgb(this.right_indicator_range, 0)
-            }
-        }
-        
-    }
-}
-
-class BikeLightsBlinking extends Effect {
-    light_state: BikeLightState
-    left_brake_range: neopixel.Strip
-    left_indicator_range: neopixel.Strip
-    left_interior_range: neopixel.Strip
-    right_brake_range: neopixel.Strip
-    right_indicator_range: neopixel.Strip
-    right_interior_range: neopixel.Strip
-    averager: AccelerometerAverage;
-    indicator_tick_rate: number
-    brake_tick_rate:number
-
-    constructor(left_strip: neopixel.Strip, right_strip: neopixel.Strip) {
-        super(left_strip, right_strip)
-        this.tick_rate = 1; // call each loop
-        this.indicator_tick_rate = 0;
-        this.brake_tick_rate = 0
-        this.left_indicator_range = this.left_strip.range(INDICATOR_LIGHT_START, INDICATOR_LIGHT_END);
-        this.left_brake_range = this.left_strip.range(INDICATOR_LIGHT_END, BRAKE_LIGHT_END - INDICATOR_LIGHT_END);
-        this.left_interior_range = this.left_strip.range(BRAKE_LIGHT_END, INTERIOR_LIGHT_END - BRAKE_LIGHT_END)
-        this.right_indicator_range = this.right_strip.range(INDICATOR_LIGHT_START, INDICATOR_LIGHT_END);
-        this.right_brake_range = this.right_strip.range(INDICATOR_LIGHT_END, BRAKE_LIGHT_END - INDICATOR_LIGHT_END);
-        this.right_interior_range = this.right_strip.range(BRAKE_LIGHT_END, INTERIOR_LIGHT_END - BRAKE_LIGHT_END)
-    }
-
-    initialise() {
-        this.default_strip_settings()
-        light_state.reset()
-        this.indicator_tick_rate = 0
-        this.brake_tick_rate = 0
-
-        broadcastLightEffect(LightEffectMode.BikeLights)
-    }
-
-    tick() {
-        light_state.set_flag(LightMode.NightLights)
-        
-        if (light_state.get_flag(LightMode.NightLights)) {
-            setAllRgb(this.left_interior_range, 0xffffff)
-            setAllRgb(this.right_interior_range, 0xffffff)
-            this.left_interior_range.setBrightness(INTERIOR_LIGHT_BRIGHTNESS)
-            this.right_interior_range.setBrightness(INTERIOR_LIGHT_BRIGHTNESS)
-        }
-
-        this.brake_tick_rate = (this.brake_tick_rate + 1) % (2*STANDARD_QUANTUM)
-        
-        if (this.brake_tick_rate == 0) {
-            light_state.toggle_state(LightState.Brake)
-        }
-
-        // light_state.set_flag(LightState.Brake);
-        setAllRgb(this.left_brake_range, 0xff0000)
-        setAllRgb(this.right_brake_range, 0xff0000)
-        if (light_state.get_flag(LightState.Brake)) {
-            this.left_brake_range.setBrightness(BRAKE_LIGHT_BRIGHTNESS);
-            this.right_brake_range.setBrightness(BRAKE_LIGHT_BRIGHTNESS);
-        } else {
-            this.left_brake_range.setBrightness(NIGHT_LIGHT_BRIGHTNESS);
-            this.right_brake_range.setBrightness(NIGHT_LIGHT_BRIGHTNESS);
-        }
-
-        this.indicator_tick_rate = (this.indicator_tick_rate + 1) % STANDARD_QUANTUM;
-
-        if (this.indicator_tick_rate == 0) {
-            if (light_state.get_flag(LightMode.IndicateLeft)) {
-                light_state.toggle_left_indicator()
-
-                if (light_state.get_flag(LightState.LeftIndicate)) {
-                    broadcastEffectCommand(BikeLightEffectState.LeftOn)
-                    setAllRgb(this.left_indicator_range, 0xffa500)
-                } else {
-                    setAllRgb(this.left_indicator_range, 0)
-                    broadcastEffectCommand(BikeLightEffectState.LeftOff)
-                }
-
-            } else {
-                setAllRgb(this.left_indicator_range, 0)
-            }
-
-            if (light_state.get_flag(LightMode.IndicateRight)) {
-                light_state.toggle_right_indicator()
-
-                if (light_state.get_flag(LightState.RightIndicate)) {
-                    broadcastEffectCommand(BikeLightEffectState.RightOn)
-                    setAllRgb(this.right_indicator_range, 0xffa500)
-                } else {
-                    setAllRgb(this.right_indicator_range, 0)
-                    broadcastEffectCommand(BikeLightEffectState.RightOff)
-                }
-            } else {
-                setAllRgb(this.right_indicator_range, 0)
-            }
-        }
-
-    }
-}
-
-radio.setGroup(RADIO_GROUP)
+radio.setGroup(BikeRadio.GROUP)
 radio.setTransmitPower(7)
-
-
-const processControlCommand = (command: number) => {
-    switch (command) {
-        case ControlCommand.Clear:
-            control.reset()
-            light_state.reset()
-            effects_idx = 0;
-            basic.showNumber(0);
-            break
-        case ControlCommand.IndicateLeft:
-            light_state.unset_flag(LightMode.IndicateRight)
-            light_state.toggle_mode(LightMode.IndicateLeft)
-            break
-        case ControlCommand.IndicateRight:
-            light_state.unset_flag(LightMode.IndicateLeft)
-            light_state.toggle_mode(LightMode.IndicateRight)
-            break
-        case ControlCommand.NightMode:
-            light_state.set_flag(LightMode.NightLights)
-            break
-        case ControlCommand.DayMode:
-            light_state.unset_flag(LightMode.NightLights)
-            break
-        case ControlCommand.NextMode:
-            effects_idx = (effects_idx + 1) % effects.length
-            basic.showNumber(effects_idx)
-            break
-        case ControlCommand.ForceBrakeLights:
-            light_state.toggle_state(LightState.Brake)
-            break
+radio.onReceivedBuffer(function (data: Buffer) {
+    if (data.length >= 2 && data[0] == BikeRadio.VERSION &&
+        data[1] != BikeRadio.PacketType.RearCommand && data[1] != BikeRadio.PacketType.CabinCommand)
+        return
+    const type = data.length >= 2 ? data[1] : 0
+    if ((type != BikeRadio.PacketType.RearCommand && type != BikeRadio.PacketType.CabinCommand) ||
+        !BikeRadio.validPacket(data, type)) {
+        console.log("Ignoring invalid radio command")
+        return
     }
-}
-
-radio.onReceivedNumber((receivedNumber) => {
-    processControlCommand(receivedNumber)
+    if (type == BikeRadio.PacketType.RearCommand)
+        rear_inbox = data
+    else
+        cabin_inbox = data
 })
 
-const averager = new AccelerometerAverage()
-const light_state = new BikeLightState()
+function applyState(state: number, now: number, rear_command: boolean) {
+    if (state == desired_state && (!startup || !rear_command))
+        return
+    if ((state & 7) != (desired_state & 7) || (startup && rear_command))
+        mode_started = now
+    if ((state & (BikeRadio.LEFT | BikeRadio.RIGHT)) !=
+        (desired_state & (BikeRadio.LEFT | BikeRadio.RIGHT)) || (startup && rear_command))
+        indicator_started = now
+    if ((state & (BikeRadio.FRONT_MODE_MASK | BikeRadio.FRONT_OFF)) !=
+        (desired_state & (BikeRadio.FRONT_MODE_MASK | BikeRadio.FRONT_OFF)))
+        front_started = now
+    desired_state = state
+    if (rear_command)
+        startup = false
+    last_frame = now - FRAME_INTERVAL
+    status_due = 3
+}
 
-let left_strip = neopixel.create(DigitalPin.P0, STRIP_LENGTH, NeoPixelMode.RGB)
-let right_strip = neopixel.create(DigitalPin.P1, STRIP_LENGTH, NeoPixelMode.RGB)
+function receiveCommand(data: Buffer, now: number) {
+    if (data.getNumber(NumberFormat.UInt32LE, 2) != lights_session)
+        return
+    const domain = data[1] == BikeRadio.PacketType.RearCommand ?
+        BikeRadio.Domain.Rear : BikeRadio.Domain.Cabin
+    const peer = domain == BikeRadio.Domain.Rear ? rear_peer : cabin_peer
+    const session = data.getNumber(NumberFormat.UInt32LE, 6)
+    const sequence = data.getNumber(NumberFormat.UInt32LE, 10)
+    if (peer.accept(session, sequence)) {
+        const mask = BikeRadio.domainMask(domain)
+        const state = (desired_state & ~mask) | data.getNumber(NumberFormat.UInt16LE, 14)
+        applyState(state, now, domain == BikeRadio.Domain.Rear)
+    }
+    // A duplicate can be a retry after its acknowledgement was lost.
+    status_due |= 1 << domain
+}
 
-let effects = [new BikeLightsBlinking(left_strip, right_strip), new Hazard(left_strip, right_strip), new Rainbow(left_strip, right_strip), new BumbleBee(left_strip, right_strip), new BikeLights(left_strip, right_strip)]
-let effects_idx = 0
+function renderStartup(now: number): boolean {
+    const elapsed = BikeRadio.elapsed(now, startup_started)
+    if (elapsed < 1500) {
+        const position = Math.floor(elapsed / 10) % (2 * (STRIP_LENGTH - 1))
+        const index = position < STRIP_LENGTH ? position : 2 * (STRIP_LENGTH - 1) - position
+        rear_strip.fill(0, STRIP_LENGTH, 0, 255)
+        rear_strip.fill(index, index + 1, 0xff0000, 128)
+        return true
+    }
+    const step = Math.floor((elapsed - 1500) / 100)
+    const brightness = [0, 16, 32, 64, 128, 255]
+    if (step < brightness.length) {
+        rear_strip.fill(0, STRIP_LENGTH, 0xff0000, brightness[step])
+        return true
+    }
+    startup = false
+    mode_started = now
+    indicator_started = now
+    return false
+}
 
-input.onButtonPressed(Button.AB, function() {
-    processControlCommand(ControlCommand.NextMode)
+function renderFront(now: number) {
+    const mode = BikeRadio.frontMode(desired_state)
+    const brightness = FRONT_BRIGHTNESS[(desired_state & BikeRadio.FRONT_LEVEL_MASK) >> 9]
+    if (mode == BikeRadio.FrontMode.Off) {
+        front_strip.fill(0, STRIP_LENGTH, 0, 255)
+    } else if (mode == BikeRadio.FrontMode.Rainbow) {
+        const offset = Math.floor(BikeRadio.elapsed(now, front_started) / BLINK_INTERVAL)
+        for (let i = 0; i < STRIP_LENGTH; i++) {
+            const color = neopixel.hsl(((i + offset) * 360 / STRIP_LENGTH) % 360, 100, 50)
+            front_strip.fill(i, i + 1, color, brightness)
+        }
+    } else {
+        front_strip.fill(0, STRIP_LENGTH, FRONT_COLORS[mode], brightness)
+    }
+    front_strip.show()
+}
+
+function renderLights(now: number) {
+    let state = desired_state
+    renderFront(now)
+    if (startup && renderStartup(now)) {
+        rear_strip.show()
+        return
+    }
+    const mode = desired_state & 7
+    const indicator_on = Math.floor(BikeRadio.elapsed(now, indicator_started) / BLINK_INTERVAL) % 2 == 0
+    const hazards_on = mode == BikeRadio.Mode.Hazards &&
+        Math.floor(BikeRadio.elapsed(now, mode_started) / BLINK_INTERVAL) % 2 == 0
+    const left_on = hazards_on || (mode != BikeRadio.Mode.Hazards &&
+        (desired_state & BikeRadio.LEFT) != 0 && indicator_on)
+    const right_on = hazards_on || (mode != BikeRadio.Mode.Hazards &&
+        (desired_state & BikeRadio.RIGHT) != 0 && indicator_on)
+    const night = (desired_state & BikeRadio.NIGHT) != 0
+    const brightness = brake_sensor.braking ? 255 : (night ? NIGHT_BRIGHTNESS : 0)
+    rear_strip.fill(LEFT_INDICATOR_END, RIGHT_INDICATOR_START, 0xff0000, brightness)
+    rear_strip.fill(0, LEFT_INDICATOR_END, left_on ? 0xffa500 : 0, 128)
+    rear_strip.fill(RIGHT_INDICATOR_START, STRIP_LENGTH, right_on ? 0xffa500 : 0, 128)
+    if (left_on)
+        state |= BikeRadio.LEFT_ON
+    if (right_on)
+        state |= BikeRadio.RIGHT_ON
+    if (brake_sensor.braking)
+        state |= BikeRadio.BRAKE_ON
+    if (state != rendered_state) {
+        rendered_state = state
+        status_due = 3
+    }
+    rear_strip.show()
+}
+
+function sendStatus(now: number) {
+    const rear_due = (status_due & 1) != 0 || BikeRadio.elapsed(now, last_rear_status) >= STATUS_INTERVAL
+    const cabin_due = (status_due & 2) != 0 || BikeRadio.elapsed(now, last_cabin_status) >= STATUS_INTERVAL
+    if (!rear_due && !cabin_due)
+        return
+    // Alternate acknowledgements; never send both radio packets back-to-back.
+    const domain = rear_due && (!cabin_due || last_status_domain == BikeRadio.Domain.Cabin) ?
+        BikeRadio.Domain.Rear : BikeRadio.Domain.Cabin
+    const peer = domain == BikeRadio.Domain.Rear ? rear_peer : cabin_peer
+    status_due &= ~(1 << domain)
+    last_status_domain = domain
+    if (domain == BikeRadio.Domain.Rear)
+        last_rear_status = now
+    else
+        last_cabin_status = now
+    status_revision = (status_revision + 1) % 65536
+    const state = rendered_state < 0 || startup ? desired_state : rendered_state
+    radio.sendBuffer(BikeRadio.packet(BikeRadio.statusType(domain), lights_session,
+        peer.session, peer.sequence, state, status_revision))
+}
+
+basic.forever(function () {
+    const now = input.runningTime()
+    if (rear_inbox != null) {
+        const data = rear_inbox
+        rear_inbox = null
+        receiveCommand(data, now)
+    }
+    if (cabin_inbox != null) {
+        const data = cabin_inbox
+        cabin_inbox = null
+        receiveCommand(data, now)
+    }
+    while (light_actions.length > 0)
+        applyState(BikeRadio.change(desired_state, light_actions.shift()), now, true)
+    if (BikeRadio.elapsed(now, last_sample) >= 20) {
+        last_sample = now
+        brake_sensor.sample(input.acceleration(Dimension.Z))
+    }
+    if (BikeRadio.elapsed(now, last_frame) >= FRAME_INTERVAL) {
+        last_frame = now
+        renderLights(now)
+    }
+    sendStatus(now)
+    basic.pause(20)
 })
 
 input.onButtonPressed(Button.A, function () {
-    processControlCommand(ControlCommand.IndicateLeft)
+    light_actions.push(BikeRadio.Action.Left)
 })
- 
 input.onButtonPressed(Button.B, function () {
-    // if (effects_idx == 4)
-    // {
-        processControlCommand(ControlCommand.ForceBrakeLights)
-    // } else {
-    //     processControlCommand(ControlCommand.IndicateRight)
-    // }
-    
+    light_actions.push(BikeRadio.Action.Right)
 })
-
-const startupEffect = new KnightRider(left_strip, right_strip)
-
-while (!startupEffect.done()) {
-    startupEffect.tick()
-    left_strip.show()
-    right_strip.show()
-    pause(5);
-}
-
-const br = [0, 16, 32,64,128, 0xff]
-
-setAllRgb(left_strip, 0xffffff)
-setAllRgb(right_strip, 0xffffff)
-
-for (let brightness of br) {
-    left_strip.setBrightness(brightness)
-    left_strip.show()
-    right_strip.show()
-    pause(25)
-}
-
-basic.showNumber(effects_idx);
-
-let prev_effect_idx = -1;
-let effect_counter = 0;
-basic.forever(function () {
-    const effect: Effect = effects[effects_idx]
-
-    if (prev_effect_idx != effects_idx) {
-        effect_counter = 0;
-        effect.initialise()
-        console.log("init")
-        prev_effect_idx = effects_idx;
-        left_strip.show()
-        right_strip.show()
-    }
-
-    effect_counter = (effect_counter + 1) % effect.tick_rate;
-
-    if (effect_counter == 0) {
-        effect.tick()
-        left_strip.show()
-        right_strip.show()
-    }
-    basic.pause(PAUSE_QUANTUM)
+input.onButtonPressed(Button.AB, function () {
+    light_actions.push(BikeRadio.Action.Hazards)
 })

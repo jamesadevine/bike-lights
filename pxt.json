@@ -9,6 +9,7 @@
     },
     "files": [
         "main.blocks",
+        "protocol.ts",
         "main.ts",
         "README.md"
     ],
