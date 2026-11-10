@@ -9,6 +9,10 @@ const BLINK_INTERVAL = 200
 const STATUS_INTERVAL = 250
 const BRAKE_THRESHOLD = 120
 const BRAKE_RELEASE_THRESHOLD = 50
+const COLOR_CYCLE = [0xff0000, 0x00ff00, 0x0000ff, 0xffffff]
+const COLOR_CYCLE_INTERVAL = 1000
+const COLOR_CYCLE_BRIGHTNESS = 128
+const COLOR_CYCLE_HOLD = 3000
 
 class BrakeSensor {
     braking = false
@@ -124,6 +128,12 @@ let indicator_started = input.runningTime()
 let front_started = input.runningTime()
 let startup_started = input.runningTime()
 let startup = true
+let color_cycle = false
+let color_cycle_started = input.runningTime()
+let held_buttons = 0
+let hold_started = 0
+let hold_active = false
+let hold_handled = false
 
 radio.setGroup(BikeRadio.GROUP)
 radio.setTransmitPower(7)
@@ -185,6 +195,42 @@ function receiveCommand(data: Buffer, now: number) {
     status_due |= 1 << domain
 }
 
+function toggleColorCycle(now: number) {
+    color_cycle = !color_cycle
+    color_cycle_started = now
+    startup = false
+    mode_started = now
+    indicator_started = now
+    last_frame = now - FRAME_INTERVAL
+    console.log("Colour cycle " + (color_cycle ? "on" : "off"))
+}
+
+// Polled so a long A+B hold can be distinguished from a short hazards press.
+// A or B alone does nothing; indicators are selected from the handlebar controller.
+function pollButtons(now: number) {
+    const pressed = (input.buttonIsPressed(Button.A) ? 1 : 0) |
+        (input.buttonIsPressed(Button.B) ? 2 : 0)
+    held_buttons |= pressed
+    if (pressed == 3) {
+        if (!hold_active) {
+            hold_started = now
+            hold_active = true
+        }
+        if (!hold_handled && BikeRadio.elapsed(now, hold_started) >= COLOR_CYCLE_HOLD) {
+            hold_handled = true
+            toggleColorCycle(now)
+        }
+    } else {
+        hold_active = false
+    }
+    if (pressed == 0 && held_buttons != 0) {
+        if (!hold_handled && held_buttons == 3)
+            light_actions.push(BikeRadio.Action.Hazards)
+        held_buttons = 0
+        hold_handled = false
+    }
+}
+
 function renderStartup(now: number): boolean {
     const elapsed = BikeRadio.elapsed(now, startup_started)
     if (elapsed < 1500) {
@@ -223,7 +269,31 @@ function renderFront(now: number) {
     front_strip.show()
 }
 
+function updateRenderedState(state: number) {
+    if (acceleration_mapper.state == AccelerationCalibrationState.Ready)
+        state |= BikeRadio.BRAKE_READY
+    if (state != rendered_state) {
+        rendered_state = state
+        status_due = 3
+    }
+}
+
+function renderColorCycle(now: number) {
+    const phase = Math.floor(BikeRadio.elapsed(now, color_cycle_started) / COLOR_CYCLE_INTERVAL)
+    const color = COLOR_CYCLE[phase % COLOR_CYCLE.length]
+    front_strip.fill(0, STRIP_LENGTH, color, COLOR_CYCLE_BRIGHTNESS)
+    rear_strip.fill(0, STRIP_LENGTH, color, COLOR_CYCLE_BRIGHTNESS)
+    front_strip.show()
+    rear_strip.show()
+    // Indicators and braking are not rendered, so status must not report them.
+    updateRenderedState(desired_state)
+}
+
 function renderLights(now: number) {
+    if (color_cycle) {
+        renderColorCycle(now)
+        return
+    }
     let state = desired_state
     renderFront(now)
     if (startup && renderStartup(now)) {
@@ -249,12 +319,7 @@ function renderLights(now: number) {
         state |= BikeRadio.RIGHT_ON
     if (brake_sensor.braking)
         state |= BikeRadio.BRAKE_ON
-    if (acceleration_mapper.state == AccelerationCalibrationState.Ready)
-        state |= BikeRadio.BRAKE_READY
-    if (state != rendered_state) {
-        rendered_state = state
-        status_due = 3
-    }
+    updateRenderedState(state)
     rear_strip.show()
 }
 
@@ -283,6 +348,7 @@ function sendStatus(now: number) {
 
 basic.forever(function () {
     const now = input.runningTime()
+    pollButtons(now)
     if (rear_inbox != null) {
         const data = rear_inbox
         rear_inbox = null
@@ -306,14 +372,4 @@ basic.forever(function () {
     }
     sendStatus(now)
     basic.pause(20)
-})
-
-input.onButtonPressed(Button.A, function () {
-    light_actions.push(BikeRadio.Action.Left)
-})
-input.onButtonPressed(Button.B, function () {
-    light_actions.push(BikeRadio.Action.Right)
-})
-input.onButtonPressed(Button.AB, function () {
-    light_actions.push(BikeRadio.Action.Hazards)
 })

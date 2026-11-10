@@ -21,13 +21,15 @@ board restarts; settings are not persisted across light-board power loss.
 
 | Device | A | B | A+B |
 | --- | --- | --- | --- |
-| Light board / rear controller | Toggle left indicator | Toggle right indicator | Toggle hazards |
+| Rear (handlebar) controller | Toggle left indicator | Toggle right indicator | Toggle hazards; hold 3 s to recalibrate braking |
+| Light board | None | None | Toggle hazards; hold 3 s to toggle colour cycle |
 | Cabin controller | Next front mode/color | Next brightness | Off / restore previous selection |
 
 Rear indication is mutually exclusive and starts illuminated. Selecting a turn
 cancels hazards; toggling hazards clears turn selections. Hazards flash the outer
 quarters only; automatic braking and the rear tail light continue in the center.
-The rear decorative/demo modes and forced-braking gesture have been removed.
+The rear decorative modes and forced-braking gesture have been removed; the only
+remaining test pattern is the light-board colour cycle below.
 
 The cabin mode cycle is white, warm white, red, green, blue, rainbow, off, then
 white. Brightness cycles through approximately 25%, 50%, 75%, and 100%.
@@ -36,10 +38,29 @@ cabin-controller restarts. Brightness changes while off do not turn the front on
 Front mode, brightness, and power are independent of rear indication, hazards,
 braking, and night/day state.
 
-The rear startup sweep and red brightness ramp are nonblocking. A local button
+The rear startup sweep and red brightness ramp are nonblocking. A local A+B action
 or rear-controller command cancels them; cabin changes do not. Front lighting
 starts independently without waiting for the rear animation. Pixel output is
 sent only when colors change, reducing radio receive gaps during NeoPixel output.
+
+### Colour-cycle test mode
+
+**On the light board itself**, hold A+B together for three seconds to toggle the
+colour cycle. Both strips, all 192 pixels, show red, green, blue, then white at
+50% brightness, advancing every second and starting at red on entry. Releasing
+after the hold does not toggle hazards; shorter A+B presses still toggle hazards.
+The handlebar controller's A+B hold remains brake recalibration and cannot
+toggle this mode. No radio protocol change is involved.
+
+**The cycle owns both strips:** braking, indicators, hazards, and tail lighting
+are not shown until it is turned off. Do not use it while riding. Brake detection,
+calibration, and both controllers' commands keep running; settings changed meanwhile
+apply on exit, and indicators restart illuminated. Status sent while it is active
+reports no rendered indicator or brake output. The mode cancels the startup
+animation and is not retained across a light-board restart.
+
+Half-brightness white across 192 pixels can draw several amps; ensure the strip
+supply and wiring can handle it before using the test.
 
 ### Automatic braking
 
@@ -73,8 +94,9 @@ On the **handlebar `bike-light-controller`**, hold A+B together for three second
 to reset the baseline, learned direction, and brake filter. Keep the bike
 stationary during and after the reset, then pull away forwards again. This leaves
 lighting settings unchanged and does not toggle hazards on release. The command
-is acknowledged and retries are idempotent. Local A+B on the light board still
-only toggles hazards. Power-cycling the light board also resets calibration;
+is acknowledged and retries are idempotent. A short A+B on the light board still
+only toggles hazards; holding it there toggles the colour-cycle test instead of
+recalibrating. Power-cycling the light board also resets calibration;
 restarting either remote controller does not. Recalibrate after remounting or an
 incorrectly learned departure.
 
