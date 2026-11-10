@@ -7,53 +7,30 @@ const FRONT_COLORS = [0xffffff, 0xffaa55, 0xff0000, 0x00ff00, 0x0000ff]
 const FRAME_INTERVAL = 50
 const BLINK_INTERVAL = 200
 const STATUS_INTERVAL = 250
-const CALIBRATION_SAMPLES = 50
 const BRAKE_THRESHOLD = 120
 const BRAKE_RELEASE_THRESHOLD = 50
 
 class BrakeSensor {
-    baseline = 0
-    calibrated = false
     braking = false
     filtered = 0
-    calibration_sum = 0
-    calibration_count = 0
-    calibration_min = 2048
-    calibration_max = -2048
 
     constructor() {
     }
 
+    reset() {
+        this.braking = false
+        this.filtered = 0
+    }
+
     sample(value: number) {
-        if (!this.calibrated) {
-            this.calibration_sum += value
-            this.calibration_count++
-            this.calibration_min = Math.min(this.calibration_min, value)
-            this.calibration_max = Math.max(this.calibration_max, value)
-            if (this.calibration_count == CALIBRATION_SAMPLES) {
-                if (this.calibration_max - this.calibration_min <= 80) {
-                    this.baseline = this.calibration_sum / CALIBRATION_SAMPLES
-                    this.calibrated = true
-                    console.log("Brake Z baseline (mg): " + this.baseline)
-                } else {
-                    console.log("Brake calibration: keep the mounted bike stationary")
-                    this.calibration_sum = 0
-                    this.calibration_count = 0
-                    this.calibration_min = 2048
-                    this.calibration_max = -2048
-                }
-            }
-            return
-        }
-        // Face forward: MakeCode Z is positive under deceleration.
-        this.filtered += (value - this.baseline - this.filtered) / 4
+        this.filtered += (value - this.filtered) / 4
         const was_braking = this.braking
         if (this.filtered >= BRAKE_THRESHOLD)
             this.braking = true
         else if (this.filtered <= BRAKE_RELEASE_THRESHOLD)
             this.braking = false
         if (this.braking != was_braking)
-            console.log("Brake " + (this.braking ? "on" : "off") + ", Z delta (mg): " + this.filtered)
+            console.log("Brake " + (this.braking ? "on" : "off") + ", deceleration (mg): " + this.filtered)
     }
 }
 
@@ -127,6 +104,7 @@ const light_actions: BikeRadio.Action[] = []
 const rear_peer = new ControllerPeer()
 const cabin_peer = new ControllerPeer()
 const lights_session = BikeRadio.session()
+const acceleration_mapper = new AccelerationMapper()
 const brake_sensor = new BrakeSensor()
 const front_strip = new LightStrip(DigitalPin.P0)
 const rear_strip = new LightStrip(DigitalPin.P1)
@@ -151,15 +129,17 @@ radio.setGroup(BikeRadio.GROUP)
 radio.setTransmitPower(7)
 radio.onReceivedBuffer(function (data: Buffer) {
     if (data.length >= 2 && data[0] == BikeRadio.VERSION &&
-        data[1] != BikeRadio.PacketType.RearCommand && data[1] != BikeRadio.PacketType.CabinCommand)
+        data[1] != BikeRadio.PacketType.RearCommand &&
+        data[1] != BikeRadio.PacketType.CabinCommand && data[1] != BikeRadio.PacketType.Recalibrate)
         return
     const type = data.length >= 2 ? data[1] : 0
-    if ((type != BikeRadio.PacketType.RearCommand && type != BikeRadio.PacketType.CabinCommand) ||
+    if ((type != BikeRadio.PacketType.RearCommand && type != BikeRadio.PacketType.CabinCommand &&
+        type != BikeRadio.PacketType.Recalibrate) ||
         !BikeRadio.validPacket(data, type)) {
         console.log("Ignoring invalid radio command")
         return
     }
-    if (type == BikeRadio.PacketType.RearCommand)
+    if (type != BikeRadio.PacketType.CabinCommand)
         rear_inbox = data
     else
         cabin_inbox = data
@@ -186,12 +166,17 @@ function applyState(state: number, now: number, rear_command: boolean) {
 function receiveCommand(data: Buffer, now: number) {
     if (data.getNumber(NumberFormat.UInt32LE, 2) != lights_session)
         return
-    const domain = data[1] == BikeRadio.PacketType.RearCommand ?
-        BikeRadio.Domain.Rear : BikeRadio.Domain.Cabin
+    const domain = data[1] == BikeRadio.PacketType.CabinCommand ?
+        BikeRadio.Domain.Cabin : BikeRadio.Domain.Rear
     const peer = domain == BikeRadio.Domain.Rear ? rear_peer : cabin_peer
     const session = data.getNumber(NumberFormat.UInt32LE, 6)
     const sequence = data.getNumber(NumberFormat.UInt32LE, 10)
     if (peer.accept(session, sequence)) {
+        if (data[1] == BikeRadio.PacketType.Recalibrate) {
+            acceleration_mapper.reset()
+            brake_sensor.reset()
+            last_frame = now - FRAME_INTERVAL
+        }
         const mask = BikeRadio.domainMask(domain)
         const state = (desired_state & ~mask) | data.getNumber(NumberFormat.UInt16LE, 14)
         applyState(state, now, domain == BikeRadio.Domain.Rear)
@@ -264,6 +249,8 @@ function renderLights(now: number) {
         state |= BikeRadio.RIGHT_ON
     if (brake_sensor.braking)
         state |= BikeRadio.BRAKE_ON
+    if (acceleration_mapper.state == AccelerationCalibrationState.Ready)
+        state |= BikeRadio.BRAKE_READY
     if (state != rendered_state) {
         rendered_state = state
         status_due = 3
@@ -287,7 +274,9 @@ function sendStatus(now: number) {
     else
         last_cabin_status = now
     status_revision = (status_revision + 1) % 65536
-    const state = rendered_state < 0 || startup ? desired_state : rendered_state
+    let state = (rendered_state < 0 || startup ? desired_state : rendered_state) & ~BikeRadio.BRAKE_READY
+    if (acceleration_mapper.state == AccelerationCalibrationState.Ready)
+        state |= BikeRadio.BRAKE_READY
     radio.sendBuffer(BikeRadio.packet(BikeRadio.statusType(domain), lights_session,
         peer.session, peer.sequence, state, status_revision))
 }
@@ -308,7 +297,8 @@ basic.forever(function () {
         applyState(BikeRadio.change(desired_state, light_actions.shift()), now, true)
     if (BikeRadio.elapsed(now, last_sample) >= 20) {
         last_sample = now
-        brake_sensor.sample(input.acceleration(Dimension.Z))
+        brake_sensor.sample(acceleration_mapper.sample(input.acceleration(Dimension.X),
+            input.acceleration(Dimension.Y), input.acceleration(Dimension.Z), now))
     }
     if (BikeRadio.elapsed(now, last_frame) >= FRAME_INTERVAL) {
         last_frame = now

@@ -43,30 +43,60 @@ sent only when colors change, reducing radio receive gaps during NeoPixel output
 
 ### Automatic braking
 
-Mount the micro:bit vertically, with its LED face pointing in the direction of
-travel. The [MakeCode acceleration documentation](https://makecode.microbit.org/reference/input/acceleration)
-identifies Z as perpendicular to the board and reports negative Z with the LED
-face upward. For the face-forward mounting, braking produces a positive Z change.
-The firmware samples `Dimension.Z`, not unsigned acceleration strength.
+Rigidly mount the micro:bit at any fixed angle; its LED face no longer needs to
+point forwards. `AccelerationMapper` in `acceleration.ts` reads all three axes and
+supplies signed longitudinal acceleration in mg to `BrakeSensor`. Positive output
+means braking; negative output means forward acceleration.
 
-Keep the bike stationary in its mounted orientation for at least one second
-after power-on. Fifty samples establish a fixed gravity/installation baseline;
-calibration is retried if the sample spread exceeds 80 mg. While calibration is
-pending, night lights and indicators still work, but automatic braking is off.
-The serial console reports the calibrated Z baseline and brake transitions.
+Calibration has three states, reported in the serial console:
 
-A low-pass-filtered positive delta of 120 mg enables braking; falling below 50 mg
-releases it. Full-brightness red takes precedence over dim night red. The default
-thresholds in `main.ts` need a mounted bench check: verify braking produces
-positive Z and acceleration produces negative Z, then check the trigger/release
-thresholds. Calibration and synthetic tests do not validate real braking.
-Pitch changes, slopes, and vibration can still affect an accelerometer-only
-detector; do not treat it as a substitute for required bicycle lighting.
+1. **Stationary:** keep the mounted bike upright and stationary after power-on.
+   Fifty samples establish a fixed gravity/installation baseline (nominally one
+   second, longer when the main loop is busy). Calibration retries if any axis
+   varies by more than 80 mg or baseline magnitude is outside 800-1200 mg.
+2. **Direction learning:** the first qualifying pull-away is assumed to be
+   forward. Horizontal acceleration must remain at least 60 mg for 600 ms, with
+   direction alignment of at least 0.95 to its running average. Strong vertical
+   motion, weak samples, inconsistent direction, or sample gaps over 100 ms
+   restart the candidate. A constant cruising speed provides no direction signal.
+3. **Ready:** the learned axis is locked until reset. Acceleration relative to
+   the startup baseline is projected onto that axis; subsequent braking cannot
+   reverse the learned direction.
+
+The first qualifying movement must be a straight forward departure, not carrying
+the bike, wheeling backwards, or immediately turning. Stationary readings cannot
+prove that the bike is still, and consistent motion can be misclassified. These
+are heuristic checks, not a guarantee of correct calibration. Weak or interrupted
+departures leave learning pending.
+
+On the **handlebar `bike-light-controller`**, hold A+B together for three seconds
+to reset the baseline, learned direction, and brake filter. Keep the bike
+stationary during and after the reset, then pull away forwards again. This leaves
+lighting settings unchanged and does not toggle hazards on release. The command
+is acknowledged and retries are idempotent. Local A+B on the light board still
+only toggles hazards. Power-cycling the light board also resets calibration;
+restarting either remote controller does not. Recalibrate after remounting or an
+incorrectly learned departure.
+
+While calibration is incomplete, automatic braking is off; tail lighting and
+indicators continue. The handlebar display shows acknowledged `C` when no
+indicator or hazards are selected, clearing once ready. The startup animation
+does not signal calibration readiness and can temporarily override brake output.
+
+A low-pass-filtered deceleration of at least 120 mg enables braking; 50 mg or below
+releases it. Full-brightness red takes precedence over dim night red. Gentle or
+brief braking may not trigger, and filter latency depends on preceding motion.
+The thresholds in `main.ts` and learning thresholds in `acceleration.ts` require a
+mounted bench check. Pitch changes, slopes, and vibration remain limitations of
+an accelerometer-only detector; arbitrary mounting support does not compensate
+for changes in orientation after calibration. Calibration and synthetic tests
+do not validate real braking; do not treat this as a substitute for required
+bicycle lighting.
 
 ## Three-board radio protocol
 
-**Flash all apps together.** Protocol version 2 is incompatible with version 1
-and the old number/toggle protocol. Use one light board, one rear controller,
+**Flash all apps together.** Protocol version 3 is incompatible with earlier
+firmware. Use one light board, one rear controller,
 and one cabin controller per radio group (default 99 in `protocol.ts`).
 Messages are not authenticated.
 
@@ -97,12 +127,19 @@ new retry budget; reconnecting after an outage or detecting a light-board
 restart also permits retrying a pending request. rapid inputs coalesce into the latest desired state. A failed request is not shown
 as successful.
 
+Recalibration uses rear-scoped packet type 5, carrying the complete desired rear
+state with the ordinary rear session and sequence. The light board applies the
+reset only when that sequence is accepted, so duplicate or stale packets cannot
+reset it again. The handlebar controller keeps that transaction unchanged until
+acknowledged; subsequent inputs wait in the queue. After retry exhaustion, it
+reports failure and releases the queue rather than blocking normal controls.
+
 Packets are fixed 18-byte buffers; multibyte fields are little-endian:
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 1 | Protocol version (2) |
-| 1 | 1 | Rear command (1), cabin command (2), rear status (3), cabin status (4) |
+| 0 | 1 | Protocol version (3) |
+| 1 | 1 | Rear command (1), cabin command (2), rear status (3), cabin status (4), recalibrate (5) |
 | 2 | 4 | Light-board boot session |
 | 6 | 4 | Scope's controller boot session (0 before first command) |
 | 10 | 4 | Scope's command sequence (0 before first command) |
@@ -114,7 +151,8 @@ left indication, bit 4 requests right indication, and bit 5 enables rear night
 lighting. Bits 6-8 select the stored front mode (0-5: white through rainbow),
 bits 9-10 select front brightness (0-3), and bit 11 turns the front off without
 discarding its selection. Status additionally carries rendered rear left-on
-(bit 12), right-on (bit 13), and brake-on (bit 14).
+(bit 12), right-on (bit 13), brake-on (bit 14), and brake-calibration-ready
+(bit 15). Readiness is status-only and is never part of desired lighting settings.
 All three `protocol.ts` copies must remain identical; both controllers also carry
 identical `client.ts` transport code. Integration tests enforce this.
 

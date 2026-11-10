@@ -1,6 +1,6 @@
 namespace BikeRadio {
     export const GROUP = 99
-    export const VERSION = 2
+    export const VERSION = 3
     export const PACKET_LENGTH = 18
     export const MAX_SEQUENCE = 0x3fffffff
     export const REAR_MASK = 0x3f
@@ -15,6 +15,7 @@ namespace BikeRadio {
     export const LEFT_ON = 0x1000
     export const RIGHT_ON = 0x2000
     export const BRAKE_ON = 0x4000
+    export const BRAKE_READY = 0x8000
 
     export enum Domain {
         Rear,
@@ -25,7 +26,8 @@ namespace BikeRadio {
         RearCommand = 1,
         CabinCommand,
         RearStatus,
-        CabinStatus
+        CabinStatus,
+        Recalibrate
     }
 
     export enum Mode {
@@ -51,7 +53,8 @@ namespace BikeRadio {
         Hazards,
         FrontNext,
         FrontBrightness,
-        FrontToggle
+        FrontToggle,
+        Recalibrate
     }
 
     export function session(): number {
@@ -133,8 +136,9 @@ namespace BikeRadio {
         if (lights < 1 || lights > MAX_SEQUENCE || controller > MAX_SEQUENCE ||
             sequence > MAX_SEQUENCE)
             return false
-        if (type == PacketType.RearCommand || type == PacketType.CabinCommand) {
-            const rear = type == PacketType.RearCommand
+        if (type == PacketType.RearCommand || type == PacketType.CabinCommand ||
+            type == PacketType.Recalibrate) {
+            const rear = type != PacketType.CabinCommand
             const mask = rear ? REAR_MASK : CABIN_MASK
             const complete = rear ? state : state | Mode.Automatic
             return controller > 0 && sequence > 0 && (state & ~mask) == 0 &&
@@ -142,7 +146,7 @@ namespace BikeRadio {
                 data.getNumber(NumberFormat.UInt16LE, 16) == 0
         }
         return (type == PacketType.RearStatus || type == PacketType.CabinStatus) &&
-            (state & ~0x7fff) == 0 && validState(state) &&
+            (state & ~0xffff) == 0 && validState(state) &&
             ((controller == 0 && sequence == 0) || (controller > 0 && sequence > 0))
     }
 }

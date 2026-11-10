@@ -10,6 +10,7 @@
     "files": [
         "main.blocks",
         "protocol.ts",
+        "acceleration.ts",
         "main.ts",
         "README.md"
     ],
