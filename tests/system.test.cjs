@@ -177,7 +177,7 @@ test('all three apps have identical protocols and both controllers share the sam
         fs.readFileSync(path.join(cabinRoot, 'client.ts'), 'utf8'));
 });
 
-test('standalone lights start in night mode, await departure, and accept local buttons', () => {
+test('standalone lights start in night mode, await departure, and ignore single local buttons', () => {
     const rig = pair(false);
     rig.advance(2200);
     assert.equal(desired(rig), 4 | 32);
@@ -185,10 +185,13 @@ test('standalone lights start in night mode, await departure, and accept local b
     assert.equal(rig.lights.run('brake_sensor.braking'), false);
     assert.equal(rig.lights.strips[1].pixels[30], 0x070000);
     assert.equal(rig.lights.strips[0].pixels[75], 0x3f3f3f);
-    rig.lights.button('B');
-    rig.advance(20);
-    assert.equal(desired(rig), 4 | 32 | 16);
-    assert.notEqual(rig.lights.strips[1].pixels[95], 0);
+    for (const button of ['A', 'B']) {
+        rig.lights.button(button);
+        rig.advance(100);
+        assert.equal(desired(rig), 4 | 32);
+        assert.equal(rig.lights.strips[1].pixels[0], 0);
+        assert.equal(rig.lights.strips[1].pixels[95], 0);
+    }
     rig.lights.button('AB');
     rig.advance(20);
     assert.equal(desired(rig) & 7, 1);
@@ -298,7 +301,7 @@ test('indicator Off is acknowledged immediately and the next activation starts O
 test('controller restart does not clear or reboot lights', () => {
     const rig = pair();
     rig.advance(400);
-    rig.lights.button('A');
+    rig.controller.button('A');
     rig.advance(100);
     const boot = rig.lights.run('lights_session');
     const state = desired(rig);
@@ -431,9 +434,9 @@ test('link loss clears controller indication but never stops standalone lighting
     rig.advance(2000);
     assert.equal(rig.controller.io.display, '!');
     assert.ok(desired(rig) & 8);
-    rig.lights.button('B');
+    rig.lights.button('AB');
     rig.advance(20);
-    assert.ok(desired(rig) & 16);
+    assert.equal(desired(rig) & 7, 1);
 });
 
 test('day mode changes only rear tail lighting, never front interior lighting', () => {
@@ -762,6 +765,78 @@ test('the cabin client cannot request brake recalibration and reset commands rej
     assert.equal(rig.lights.run('rear_peer.session'), rearSession);
 });
 
+function holdLights(rig, milliseconds) {
+    rig.lights.press('AB');
+    rig.advance(milliseconds);
+    rig.lights.release('AB');
+    rig.advance(20);
+}
+const filled = (strip, color) => strip.pixels.every(pixel => pixel === color);
+
+test('a three-second light-board A+B hold cycles both strips through R, G, B and W at half brightness', () => {
+    const rig = pair(false);
+    rig.advance(2200);
+    const before = desired(rig);
+    rig.lights.press('AB');
+    rig.advance(3040);
+    assert.equal(rig.lights.run('color_cycle'), true);
+    rig.lights.release('AB');
+    rig.advance(400);
+    for (const color of [0x7f0000, 0x007f00, 0x00007f, 0x7f7f7f, 0x7f0000]) {
+        assert.ok(rig.lights.strips.every(strip => filled(strip, color)), color.toString(16));
+        rig.advance(1000);
+    }
+    assert.equal(desired(rig), before);
+    holdLights(rig, 3040);
+    rig.advance(100);
+    assert.equal(rig.lights.run('color_cycle'), false);
+    assert.equal(desired(rig), before);
+    assert.ok(filled(rig.lights.strips[0], 0x3f3f3f));
+    assert.ok(rig.lights.strips[1].pixels.slice(24, 72).every(pixel => pixel === 0x070000));
+    assert.ok(rig.lights.strips[1].pixels.slice(0, 24).every(pixel => pixel === 0));
+});
+
+test('colour cycle owns both strips; braking, indicators and radio changes resume on exit', () => {
+    const rig = pair();
+    rig.advance(2200);
+    learnDirection(rig);
+    holdLights(rig, 3040);
+    rig.lights.io.z = 300;
+    rig.advance(300);
+    assert.equal(rig.lights.run('brake_sensor.braking'), true);
+    rig.controller.button('A');
+    rig.advance(300);
+    assert.ok(desired(rig) & 8);
+    assert.equal(rig.controller.run('client.pending'), false);
+    const status = rig.controller.run('client.reported_state');
+    assert.equal(status & 0x7000, 0);
+    assert.notEqual(status & 0x8000, 0);
+    const [front, rear] = rig.lights.strips;
+    assert.ok([0x7f0000, 0x007f00, 0x00007f, 0x7f7f7f].includes(front.pixels[0]));
+    assert.ok(filled(front, front.pixels[0]) && filled(rear, front.pixels[0]));
+    holdLights(rig, 3040);
+    assert.equal(rig.lights.run('color_cycle'), false);
+    assert.ok(rear.pixels.slice(0, 24).every(pixel => pixel === 0x7f5200));
+    assert.ok(rear.pixels.slice(24, 72).every(pixel => pixel === 0xff0000));
+    assert.ok(filled(front, 0x3f3f3f));
+    rig.advance(300);
+    assert.notEqual(rig.controller.run('client.reported_state') & 0x4000, 0);
+});
+
+test('short or interrupted light-board A+B presses toggle hazards, not the colour cycle', () => {
+    const rig = pair(false);
+    rig.advance(2200);
+    holdLights(rig, 2900);
+    assert.equal(rig.lights.run('color_cycle'), false);
+    assert.equal(desired(rig) & 7, 1);
+    rig.lights.press('A');
+    rig.advance(3200);
+    rig.lights.release('A');
+    rig.advance(20);
+    assert.equal(rig.lights.run('color_cycle'), false);
+    assert.equal(desired(rig) & (7 | 8 | 16), 1);
+});
+
 test('unchanged frames do not retransmit NeoPixel buffers', () => {
     const rig = pair(false);
     rig.advance(2200);
@@ -941,8 +1016,7 @@ test('front animation never retriggers rear indicators or rewrites unchanged rea
     rig.advance(600);
     assert.ok(rig.lights.strips[0].frames.length > frontFrames);
     assert.equal(rig.lights.strips[1].frames.length, rearFrames);
-    rig.lights.button('A');
-    rig.advance(20);
+    setState(rig, 4 | 32 | 8);
     const started = rig.lights.run('indicator_started');
     rig.cabin.button('B');
     rig.advance(120);
