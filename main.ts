@@ -134,6 +134,7 @@ let held_buttons = 0
 let hold_started = 0
 let hold_active = false
 let hold_handled = false
+let display_label = ""
 
 radio.setGroup(BikeRadio.GROUP)
 radio.setTransmitPower(7)
@@ -278,6 +279,23 @@ function updateRenderedState(state: number) {
     }
 }
 
+// One character per state; the display is written only when the state changes.
+function updateDisplay() {
+    let label = "R"
+    if (color_cycle)
+        label = "C"
+    else if (acceleration_mapper.state == AccelerationCalibrationState.Stationary)
+        label = "S"
+    else if (acceleration_mapper.state == AccelerationCalibrationState.Direction)
+        label = "L"
+    else if (brake_sensor.braking)
+        label = "B"
+    if (label != display_label) {
+        display_label = label
+        basic.showString(label, 0)
+    }
+}
+
 function renderColorCycle(now: number) {
     const phase = Math.floor(BikeRadio.elapsed(now, color_cycle_started) / COLOR_CYCLE_INTERVAL)
     const color = COLOR_CYCLE[phase % COLOR_CYCLE.length]
@@ -370,6 +388,7 @@ basic.forever(function () {
         last_frame = now
         renderLights(now)
     }
+    updateDisplay()
     sendStatus(now)
     basic.pause(20)
 })

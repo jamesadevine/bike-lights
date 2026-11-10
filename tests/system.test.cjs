@@ -28,7 +28,7 @@ function app(root, network, name) {
     const strips = [];
     const logs = [];
     let receive;
-    const io = { x: 0, y: -1024, z: 0, light: 80, display: '', sends: 0, buttons: 0 };
+    const io = { x: 0, y: -1024, z: 0, light: 80, display: '', displayWrites: 0, sends: 0, buttons: 0 };
     const buttonMask = button => button === 'AB' ? 3 : button === 'A' ? 1 : 2;
     const context = vm.createContext({
         console: { log: message => logs.push(message) },
@@ -53,7 +53,7 @@ function app(root, network, name) {
         basic: {
             forever: handler => loops.push(handler),
             pause() {},
-            showString: (value, interval) => { assert.equal(interval, 0); io.display = value; },
+            showString: (value, interval) => { assert.equal(interval, 0); io.display = value; io.displayWrites++; },
             showArrow: (value, interval) => { assert.equal(interval, 0); io.display = value; },
             clearScreen: () => { io.display = ''; }
         },
@@ -835,6 +835,32 @@ test('short or interrupted light-board A+B presses toggle hazards, not the colou
     rig.advance(20);
     assert.equal(rig.lights.run('color_cycle'), false);
     assert.equal(desired(rig) & (7 | 8 | 16), 1);
+});
+
+test('light-board display reflects calibration, braking and colour-cycle state', () => {
+    const rig = pair();
+    rig.advance(200);
+    assert.equal(rig.lights.io.display, 'S');
+    rig.advance(2000);
+    assert.equal(rig.lights.io.display, 'L');
+    learnDirection(rig);
+    assert.equal(rig.lights.io.display, 'R');
+    const writes = rig.lights.io.displayWrites;
+    rig.advance(1000);
+    assert.equal(rig.lights.io.displayWrites, writes);
+    rig.lights.io.z = 300;
+    rig.advance(300);
+    assert.equal(rig.lights.io.display, 'B');
+    rig.lights.io.z = 0;
+    rig.advance(400);
+    assert.equal(rig.lights.io.display, 'R');
+    holdLights(rig, 3040);
+    assert.equal(rig.lights.io.display, 'C');
+    holdLights(rig, 3040);
+    assert.equal(rig.lights.io.display, 'R');
+    rig.controller.run('client.queue(BikeRadio.Action.Recalibrate)');
+    rig.advance(200);
+    assert.equal(rig.lights.io.display, 'S');
 });
 
 test('unchanged frames do not retransmit NeoPixel buffers', () => {

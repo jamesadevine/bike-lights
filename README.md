@@ -43,6 +43,21 @@ or rear-controller command cancels them; cabin changes do not. Front lighting
 starts independently without waiting for the rear animation. Pixel output is
 sent only when colors change, reducing radio receive gaps during NeoPixel output.
 
+### Light-board display
+
+The light board's LED display shows one character for its current state,
+rewritten only when the state changes:
+
+| Display | State |
+| --- | --- |
+| `S` | Calibrating: keep the mounted bike stationary |
+| `L` | Learning forwards: waiting for a straight forward pull-away |
+| `R` | Ready: automatic braking active, not currently braking |
+| `B` | Braking detected |
+| `C` | Colour-cycle test mode (takes precedence over the others) |
+
+Indicators and hazards are not shown here; the handlebar controller displays them.
+
 ### Colour-cycle test mode
 
 **On the light board itself**, hold A+B together for three seconds to toggle the
